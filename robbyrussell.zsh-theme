@@ -8,6 +8,7 @@ typeset -g _rr_git_prompt_branch=''
 typeset -gi _rr_git_prompt_dirty=0
 typeset -gi _rr_git_prompt_command_ran=1
 typeset -gi _rr_git_prompt_git_command_ran=0
+typeset -gi _rr_git_prompt_repo_command_ran=0
 typeset -gi _rr_git_prompt_last_dirty_check=-9999
 typeset -gi _rr_git_prompt_dirty_ttl=5
 
@@ -23,6 +24,7 @@ _rr_git_prompt_reset() {
 _rr_git_prompt_clear_flags() {
   _rr_git_prompt_command_ran=0
   _rr_git_prompt_git_command_ran=0
+  _rr_git_prompt_repo_command_ran=0
 }
 
 _rr_git_prompt_refresh_repo() {
@@ -30,17 +32,19 @@ _rr_git_prompt_refresh_repo() {
   _rr_git_prompt_reset
 
   local git_info
-  git_info=$(command git rev-parse --is-inside-work-tree --path-format=absolute --git-dir 2>/dev/null) ||
-    git_info=$(command git rev-parse --is-inside-work-tree --git-dir 2>/dev/null) ||
-    return
+  git_info=$(command git rev-parse --is-inside-work-tree --git-dir 2>/dev/null) || return 1
 
   local -a git_lines
   git_lines=("${(@f)git_info}")
-  [[ ${git_lines[1]} == true && -n ${git_lines[2]} ]] || return
+  [[ $#git_lines == 2 && ${git_lines[1]} == true && -n ${git_lines[2]} ]] || return 1
 
   _rr_git_prompt_git_dir=${git_lines[2]}
   [[ $_rr_git_prompt_git_dir == /* ]] || _rr_git_prompt_git_dir=$PWD/$_rr_git_prompt_git_dir
   _rr_git_prompt_git_dir=${_rr_git_prompt_git_dir:A}
+  [[ -r "$_rr_git_prompt_git_dir/HEAD" ]] || {
+    _rr_git_prompt_reset
+    return 1
+  }
 }
 
 _rr_git_prompt_refresh_branch() {
@@ -70,15 +74,43 @@ _rr_git_prompt_refresh_branch() {
 _rr_git_prompt_refresh_dirty() {
   local status_line
   _rr_git_prompt_dirty=0
-  IFS= read -r status_line < <(command git -c core.optionalLocks=false status --porcelain --ignore-submodules=dirty 2>/dev/null) || true
-  [[ -n $status_line ]] &&
-    _rr_git_prompt_dirty=1
+  IFS= read -r status_line \
+    < <(command git -c core.optionalLocks=false status --porcelain --ignore-submodules=dirty 2>/dev/null) || true
+  [[ -n $status_line ]] && _rr_git_prompt_dirty=1
   _rr_git_prompt_last_dirty_check=$SECONDS
 }
 
 _rr_git_prompt_preexec() {
   _rr_git_prompt_command_ran=1
-  [[ $1 == git || $1 == git\ * || $1 == command\ git\ * ]] && _rr_git_prompt_git_command_ran=1
+  [[ $1 == git || $1 == git\ * || $1 == command\ git || $1 == command\ git\ * ]] || return 0
+
+  local -a command_words
+  command_words=(${(z)1})
+  command_words=("${(@Q)command_words}")
+
+  local command_index=1
+  [[ ${command_words[$command_index]-} == command ]] && (( ++command_index ))
+  [[ ${command_words[$command_index]-} == git ]] || return 0
+  _rr_git_prompt_git_command_ran=1
+
+  # Skip Git global options to find the subcommand.
+  (( ++command_index ))
+  while (( command_index <= $#command_words )); do
+    case ${command_words[$command_index]} in
+      -c | -C | --config-env | --git-dir | --namespace | --super-prefix | --work-tree)
+        (( command_index += 2 ))
+        ;;
+      --*=* | -*)
+        (( ++command_index ))
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  [[ ${command_words[$command_index]-} == init || ${command_words[$command_index]-} == clone ]] &&
+    _rr_git_prompt_repo_command_ran=1
   return 0
 }
 
@@ -87,9 +119,10 @@ _rr_git_prompt_precmd() {
   local dirty_check_due=0
   [[ $_rr_git_prompt_pwd != $PWD ]] && repo_changed=1
 
-  if (( repo_changed )) || { (( _rr_git_prompt_git_command_ran )) && [[ -z $_rr_git_prompt_git_dir ]]; }; then
+  # init and clone can change the repository at $PWD without changing directories.
+  if (( repo_changed || _rr_git_prompt_repo_command_ran )) ||
+    { (( _rr_git_prompt_git_command_ran )) && [[ -z $_rr_git_prompt_git_dir ]]; }; then
     _rr_git_prompt_refresh_repo || {
-      _rr_git_prompt_reset
       _rr_git_prompt_clear_flags
       return 0
     }
@@ -100,6 +133,8 @@ _rr_git_prompt_precmd() {
     return 0
   }
 
+  # Re-evaluate detached HEAD labels after commands such as git tag.
+  (( _rr_git_prompt_git_command_ran )) && _rr_git_prompt_head=''
   _rr_git_prompt_refresh_branch || {
     _rr_git_prompt_reset
     _rr_git_prompt_clear_flags
